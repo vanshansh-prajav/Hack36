@@ -233,6 +233,17 @@ const Chat = () => {
     }
   };
 
+  // Function to navigate to ChatPage with selected friend
+  const startChatWithFriend = (friend) => {
+    console.log("Starting chat with friend:", friend);
+    navigate("/chatpage", {
+      state: {
+        currentUser: currentUser,
+        friends: friends,
+        selectedFriend: friend
+      }
+    });
+  };
   
   const goToHome = () => {
     navigate("/home", { 
@@ -263,17 +274,28 @@ const Chat = () => {
         </button>
       </div>
 
-      {/* Friends list */}
+      {/* Friends list - Enhanced to be obviously clickable */}
       <div className="mt-4 bg-gray-800 p-6 rounded-lg">
         <h2 className="text-xl font-bold mb-4">Your Friends</h2>
+        <p className="text-gray-400 mb-4">Click on a friend to start chatting</p>
+        
         {Array.isArray(friends) && friends.length > 0 ? (
-          <ul className="divide-y divide-gray-700">
+          <ul className="space-y-2">
             {friends.map((friend, index) => (
-              <li key={friend.id || index} className="py-3 flex items-center">
-                <div className="w-10 h-10 bg-purple-500 rounded-full flex items-center justify-center text-white font-bold">
-                  {friend.username?.charAt(0).toUpperCase() || "?"}
+              <li 
+                key={friend.id || index} 
+                className="bg-gray-700 hover:bg-gray-600 transition-all duration-200 p-3 rounded-lg flex items-center justify-between cursor-pointer border border-transparent hover:border-purple-500"
+              >
+                <div className="flex items-center">
+                  <div className="w-10 h-10 bg-purple-500 rounded-full flex items-center justify-center text-white font-bold">
+                    {friend.username?.charAt(0).toUpperCase() || "?"}
+                  </div>
+                  <span className="ml-3 font-medium">{friend.username}</span>
                 </div>
-                <span className="ml-3">{friend.username}</span>
+                
+                <button onClick={() => startChatWithFriend(friend)} className="bg-purple-600 hover:bg-purple-500 text-white py-1 px-3 rounded text-sm">
+                  Chat Now
+                </button>
               </li>
             ))}
           </ul>
