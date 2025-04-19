@@ -1,84 +1,164 @@
-import { useNavigate } from 'react-router';
-import useWallet from '../hooks/useWallet';
-import { useState } from 'react';
-
-import Gun from 'gun';
+import { useNavigate } from "react-router";
+import useWallet from "../hooks/useWallet";
+import { useState } from "react";
+import Gun from "gun";
 
 const gun = Gun({
-  peers: ['http://localhost:4000/gun']
+  peers: ["http://localhost:4000/gun", "https://gun-manhattan.herokuapp.com/gun"],
 });
 
 const authenticateUser = ({ account, username }) => {
   return new Promise((resolve, reject) => {
-    console.log('Authenticating user...');
-
-    const userRef = gun.get('users').get(account);
-
-    userRef.once((profile) => {
-      if (!profile) {
-        userRef.put({
+    const usersSet = gun.get("usersList");
+    usersSet.get(account).once((userData) => {
+      if (!userData) {
+        
+        usersSet.get(account).put({
+          account,
           username,
-          address: account,
-          createdAt: Date.now()
+          address: account, 
+          createdAt: new Date().toISOString(),
+          lastLogin: new Date().toISOString()
+        }, (ack) => {
+          if (ack.err) return reject(`Error storing user: ${ack.err}`);
+          
+          
+          usersSet
+            .get(account)
+            .get("friends")
+            .set([], (friendAck) => {
+              if (friendAck.err) {
+                return reject(`Error initializing friends: ${friendAck.err}`);
+              }
+              
+              gun.get("usersList").once(() => {
+                resolve("User created and synced");
+              });
+            });
         });
-        return resolve('created');
+      } else {
+        
+        usersSet.get(account).put({
+          lastLogin: new Date().toISOString()
+        });
+        
+        if (userData.username !== username) {
+          return reject(new Error("Username mismatch"));
+        }
+        return resolve("Authenticated");
       }
-      else if (profile.username !== username) {
-        return reject(new Error('Username mismatch'));
-      }
-
-      console.log('User authenticated:', account);
-      return resolve('authenticated');
     });
   });
 };
 
+export function getUserProfile(account) {
+  return new Promise((resolve, reject) => {
+    if (!account) {
+      return reject(new Error("No account provided"));
+    }
+    
+    gun
+      .get("usersList")
+      .get(account)
+      .once((profile) => {
+        if (!profile) {
+          return reject(new Error("Profile not found"));
+        }
+        
+        
+        const safeProfile = {
+          ...profile,
+          friends: Array.isArray(profile.friends) ? profile.friends : []
+        };
+        
+        resolve(safeProfile);
+      });
+  });
+}
+
 function Auth() {
   const { connectWallet, account, signature, connecting, error } = useWallet();
-  const [username, setUsername] = useState();
+  const [username, setUsername] = useState("");
+  const [authError, setAuthError] = useState("");
   const navigate = useNavigate();
 
   const handleConnect = async () => {
     try {
+      setAuthError("");
+      
       if (!username) {
-        alert("Username is required to login");
+        setAuthError("Username is required");
         return;
       }
-
+      
       await connectWallet();
-      if (error) return;
-
-      if (account) {
-        const status = await authenticateUser({ account, username });
-        if (status === 'authenticated' || status === 'created') {
-          localStorage.setItem(`userDataStored${account}`, JSON.stringify({ username, account, signature }));
-          navigate('/home', { state: { dataString: `userDataStored${account}`, username, account, signature } });
-        }
+      
+      if (error) {
+        setAuthError(error);
+        return;
       }
+      
+      if (!account) {
+        console.warn("No account after connectWallet");
+        setAuthError("Failed to connect wallet");
+        return;
+      }
+      
+      
+      localStorage.setItem('userData', JSON.stringify({
+        account,
+        username,
+        lastLogin: new Date().toISOString(),
+        friends: []
+      }));
+
+      await authenticateUser({ account, username });
+      const userData = await getUserProfile(account);
+      
+      navigate("/home", { 
+        state: {
+          ...userData,
+          account,
+          signature,
+          username
+        }
+      });
     } catch (err) {
-      console.error('Authentication failed:', err);
-      alert(err.message);
+      console.error("Authentication failed:", err);
+      setAuthError(err.message || "Authentication failed");
     }
   };
 
-
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-r from-purple-400 via-pink-500 to-red-500">
-      <div className="flex flex-col gap-2 bg-white p-8 rounded-lg shadow-lg w-full max-w-md text-center">
-        <h1 className="text-3xl font-semibold text-gray-800 mb-6">🛡️ Decentralized Chat</h1>
-        <div className='flex flex-col'>
-          <strong className='text-start text-gray-800'>Enter Username: (required)</strong>
-          <input autoFocus={true} onChange={(e) => setUsername(e.target.value)} type='text' className='rounded-md text-4xl bg-slate-400 text-gray-800' />
+    <div className="min-h-screen flex items-center justify-center bg-gray-900">
+      <div className="bg-gray-800 p-8 rounded-lg shadow-lg w-full max-w-md">
+        <h1 className="text-3xl font-bold text-white mb-6">Connect Wallet</h1>
+        
+        <div className="mb-4">
+          <label htmlFor="username" className="block text-white mb-2">Username</label>
+          <input
+            type="text"
+            id="username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            className="w-full p-2 rounded bg-gray-700 text-white border border-gray-600 focus:border-purple-500 focus:outline-none"
+            placeholder="Enter username"
+          />
         </div>
+        
         <button
           onClick={handleConnect}
           disabled={connecting}
           className="w-full py-3 bg-purple-600 text-white font-semibold rounded-lg hover:bg-purple-700 transition duration-300 disabled:opacity-50"
         >
-          {connecting ? 'Connecting...' : 'Connect MetaMask'}
+          {connecting ? "Connecting..." : "Connect with MetaMask"}
         </button>
-
-        {error && <p className="mt-4 text-red-500 text-sm">{error}</p>}
+        
+        {(authError || error) && (
+          <div className="mt-4 text-red-400">
+            {authError || error}
+          </div>
+        )}
       </div>
     </div>
   );
