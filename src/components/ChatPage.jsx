@@ -1,612 +1,522 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useLocation } from 'react-router';
 import Gun from 'gun';
-import 'gun/sea'; // For encryption capabilities
+import 'gun/sea';
 
-// Initialize Gun with peers
 const gun = Gun({
   peers: [
     'http://localhost:4000/gun',
     'https://gun-manhattan.herokuapp.com/gun'
   ],
-  localStorage: false
+  localStorage: false,
 });
 
-const ChatPage = () => {
+export default function ChatPage() {
   const navigate = useNavigate();
   const location = useLocation();
-  const messageInputRef = useRef(null);
-  const messagesEndRef = useRef(null);
-  
-  // State variables
+  const didInit = useRef(false);
+
+  // Identity & Loading
+  const [isLoading, setIsLoading] = useState(true);
   const [currentUser, setCurrentUser] = useState(null);
   const [selectedFriend, setSelectedFriend] = useState(null);
+
+  // Messages & UI
   const [messages, setMessages] = useState([]);
   const [messageText, setMessageText] = useState('');
-  const [isLoading, setIsLoading] = useState(true);
+  const messagesEndRef = useRef(null);
 
-  // Load user data from location state or localStorage
-  useEffect(() => {
-    if (location.state && location.state.currentUser && location.state.selectedFriend) {
-      setCurrentUser(location.state.currentUser);
-      setSelectedFriend(location.state.selectedFriend);
-    } else {
-      const savedData = localStorage.getItem('userData');
-      if (savedData) {
-        try {
-          const parsedData = JSON.parse(savedData);
-          setCurrentUser({
-            username: parsedData.username,
-            account: parsedData.account,
-            address: parsedData.account
-          });
-          
-          // If no selected friend in state, redirect to friends list
-          if (location.state && location.state.selectedFriend) {
-            setSelectedFriend(location.state.selectedFriend);
-          } else {
-            navigate('/chat');
-            return;
-          }
-        } catch (e) {
-          console.error("Error parsing saved user data:", e);
-          navigate('/');
-        }
-      } else {
-        navigate('/');
-      }
+  // Encryption state
+  const [encryptionReady, setEncryptionReady] = useState(false);
+
+  // MetaMask helpers
+  const getEncryptionPublicKey = useCallback(async (address) => {
+    try {
+      return await window.ethereum.request({
+        method: 'eth_getEncryptionPublicKey',
+        params: [address],
+      });
+    } catch {
+      return null;
     }
+  }, []);
+
+  // 1. One-time load
+  useEffect(() => {
+    if (didInit.current) return;
+    didInit.current = true;
+
+    const state = location.state;
+    const saved = localStorage.getItem('userData');
+
+    if (state?.currentUser && state.selectedFriend) {
+      setCurrentUser(state.currentUser);
+      setSelectedFriend(state.selectedFriend);
+    } else if (saved) {
+      try {
+        const { username, account } = JSON.parse(saved);
+        setCurrentUser({ username, address: account });
+        const friendStr = localStorage.getItem('selectedFriend');
+        if (friendStr) {
+          setSelectedFriend(JSON.parse(friendStr));
+        } else {
+          navigate('/friends', { replace: true });
+          return;
+        }
+      } catch {
+        navigate('/', { replace: true });
+        return;
+      }
+    } else {
+      navigate('/', { replace: true });
+      return;
+    }
+
     setIsLoading(false);
   }, [location, navigate]);
 
-  // Subscribe to messages when users are loaded
+  // 2. Publish public key
+  useEffect(() => {
+    if (!currentUser?.address) return;
+    (async () => {
+      const key = await getEncryptionPublicKey(currentUser.address);
+      if (key) {
+        gun.get('users').get(currentUser.address).put({ publicKey: key });
+        setEncryptionReady(true);
+      }
+    })();
+  }, [currentUser, getEncryptionPublicKey]);
+
+  // 3. Subscribe to messages
   useEffect(() => {
     if (!currentUser || !selectedFriend) return;
-    
-    // Create a unique chat ID based on user IDs (sorted to ensure consistency)
+
     const chatId = [currentUser.address, selectedFriend.address].sort().join('_');
-    const messagesRef = gun.get('chats').get(chatId);
-    
-    console.log(`Subscribing to chat ${chatId} between ${currentUser.username} and ${selectedFriend.username}`);
-    
-    // Listen for new messages
-    const messageListener = messagesRef.map().on((messageData, messageId) => {
-      if (messageData && messageData.text && messageData.sender && messageData.timestamp) {
-        setMessages(prevMessages => {
-          // Check if message already exists to avoid duplicates
-          const exists = prevMessages.some(msg => msg.id === messageId);
-          if (exists) return prevMessages;
-          
-          // Add new message
-          const newMessage = {
-            id: messageId,
-            text: messageData.text,
-            sender: messageData.sender,
-            timestamp: messageData.timestamp,
-            isMine: messageData.sender === currentUser.address
-          };
-          
-          // Sort messages by timestamp
-          return [...prevMessages, newMessage].sort((a, b) => a.timestamp - b.timestamp);
-        });
-      }
-    });
-    
-    // Cleanup subscription on unmount
-    return () => {
-      messagesRef.map().off(messageListener);
+    const chatRef = gun.get('chats').get(chatId);
+    setMessages([]);
+
+    const processMessage = (data, id) => {
+      if (!data?.text || !data.timestamp || !data.sender) return;
+      setMessages(prev => {
+        if (prev.some(m => m.id === id)) return prev;
+        return [
+          ...prev,
+          {
+            id,
+            text: data.text,
+            sender: data.sender,
+            timestamp: data.timestamp,
+            isMine: data.sender === currentUser.address,
+          }
+        ].sort((a, b) => a.timestamp - b.timestamp);
+      });
     };
+
+    chatRef.map().once(processMessage);
+    chatRef.map().on(processMessage);
+
+    return () => { chatRef.map().off(); };
   }, [currentUser, selectedFriend]);
 
-  // Auto-scroll to bottom when messages change
+  // Auto-scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const sendMessage = (e) => {
+  // Send message
+  const sendMessage = useCallback(async (e) => {
     e.preventDefault();
-    
-    if (!messageText.trim()) return;
-    
-    // Create a unique chat ID (same as in the subscription)
+    if (!messageText.trim() || !encryptionReady) return;
     const chatId = [currentUser.address, selectedFriend.address].sort().join('_');
-    const messagesRef = gun.get('chats').get(chatId);
-    
-    // Create message object
-    const messageObject = {
+    const chatRef = gun.get('chats').get(chatId);
+    chatRef.set({
       text: messageText,
       sender: currentUser.address,
-      senderName: currentUser.username,
-      receiver: selectedFriend.address,
-      timestamp: Date.now()
-    };
-    
-    // Save message to Gun
-    messagesRef.set(messageObject, (ack) => {
-      if (ack.err) {
-        console.error("Error sending message:", ack.err);
-      } else {
-        console.log("Message sent successfully");
-      }
+      timestamp: Date.now(),
     });
-    
-    // Clear input field
     setMessageText('');
-    messageInputRef.current.focus();
+  }, [messageText, encryptionReady, currentUser, selectedFriend]);
+
+  // Group messages by date for better organization
+  const groupMessagesByDate = (msgs) => {
+    const groups = {};
+    msgs.forEach(msg => {
+      const date = new Date(msg.timestamp).toLocaleDateString();
+      if (!groups[date]) groups[date] = [];
+      groups[date].push(msg);
+    });
+    return groups;
   };
 
-  // Handle back navigation
-  const goBack = () => {
-    navigate('/chat');
-  };
+  const groupedMessages = groupMessagesByDate(messages);
 
   if (isLoading) {
-    return <div className="flex justify-center items-center h-screen text-lg text-gray-600">Loading chat...</div>;
+    return (
+      <div style={{
+        display: 'flex',
+        justifyContent: 'center',
+        alignItems: 'center',
+        height: '100vh',
+        backgroundColor: '#f5f7fb',
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, sans-serif'
+      }}>
+        <div style={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: '16px'
+        }}>
+          <div style={{
+            width: '40px',
+            height: '40px',
+            border: '3px solid #e0e0e0',
+            borderTopColor: '#3b82f6',
+            borderRadius: '50%',
+            animation: 'spin 1s linear infinite'
+          }}></div>
+          <p style={{ color: '#64748b', fontSize: '16px' }}>Loading chat...</p>
+        </div>
+        <style>{`
+          @keyframes spin {
+            to { transform: rotate(360deg); }
+          }
+        `}</style>
+      </div>
+    );
   }
 
   return (
-    <div className="flex flex-col h-screen max-w-2xl mx-auto bg-gray-50">
-      <header className="flex items-center p-4 bg-blue-600 text-white shadow-md">
-        <button 
-          className="bg-transparent border-none text-white text-2xl mr-4 cursor-pointer hover:text-gray-200 transition-colors" 
-          onClick={goBack}
-        >
-          ←
-        </button>
-        <div className="flex-1">
-          <h2 className="text-lg font-semibold m-0">{selectedFriend?.username}</h2>
+    <div style={{
+      display: 'flex',
+      flexDirection: 'column',
+      height: '100vh',
+      backgroundColor: '#f5f7fb',
+      fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, sans-serif'
+    }}>
+      {/* Enhanced Header */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        padding: '16px',
+        backgroundColor: 'white',
+        boxShadow: '0 1px 3px rgba(0, 0, 0, 0.1)',
+        position: 'relative',
+        zIndex: 10
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', width: '100%' }}>
+          <button
+            onClick={() => navigate('/home', { replace: true })}
+            style={{
+              background: 'none',
+              border: 'none',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: '40px',
+              height: '40px',
+              borderRadius: '50%',
+              transition: 'background-color 0.2s',
+              marginRight: '12px'
+            }}
+            onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#f0f0f0'}
+            onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+          >
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M15 18L9 12L15 6" stroke="#374151" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </button>
+          
+          <div style={{ display: 'flex', alignItems: 'center' }}>
+            <div style={{
+              width: '48px',
+              height: '48px',
+              borderRadius: '50%',
+              backgroundColor: '#e5e7eb',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              marginRight: '12px',
+              fontSize: '20px',
+              fontWeight: 'bold',
+              color: '#4b5563'
+            }}>
+              {selectedFriend.username.charAt(0).toUpperCase()}
+            </div>
+            
+            <div style={{ display: 'flex', flexDirection: 'column' }}>
+              <h2 style={{ margin: 0, fontSize: '18px', fontWeight: '600', color: '#111827' }}>
+                {selectedFriend.username}
+              </h2>
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                fontSize: '14px',
+                color: encryptionReady ? '#059669' : '#d97706',
+                marginTop: '4px'
+              }}>
+                {encryptionReady ? (
+                  <>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ marginRight: '6px' }}>
+                      <path d="M19 11H5V21H19V11Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                      <path d="M17 11V7C17 4.23858 14.7614 2 12 2C9.23858 2 7 4.23858 7 7V11" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                    </svg>
+                    Encrypted
+                  </>
+                ) : (
+                  <>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ marginRight: '6px' }}>
+                      <path d="M12 16V16.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                      <path d="M12 8V12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                      <path d="M12 21C16.9706 21 21 16.9706 21 12C21 7.02944 16.9706 3 12 3C7.02944 3 3 7.02944 3 12C3 16.9706 7.02944 21 12 21Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                    </svg>
+                    Setting up encryption...
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
         </div>
-      </header>
-      
-      <div className="flex-1 p-4 overflow-y-auto">
+      </div>
+
+      {/* Enhanced Messages Container */}
+      <div style={{
+        flex: 1,
+        overflowY: 'auto',
+        padding: '20px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '8px'
+      }}>
         {messages.length === 0 ? (
-          <div className="flex items-center justify-center h-full text-gray-500">
-            <p>No messages yet. Say hello to {selectedFriend?.username}!</p>
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            height: '100%',
+            color: '#6b7280',
+            textAlign: 'center',
+            padding: '0 20px'
+          }}>
+            <svg width="64" height="64" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ marginBottom: '16px', color: '#d1d5db' }}>
+              <path d="M21 15C21 15.5304 20.7893 16.0391 20.4142 16.4142C20.0391 16.7893 19.5304 17 19 17H7L3 21V5C3 4.46957 3.21071 3.96086 3.58579 3.58579C3.96086 3.21071 4.46957 3 5 3H19C19.5304 3 20.0391 3.21071 20.4142 3.58579C20.7893 3.96086 21 4.46957 21 5V15Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+            <p style={{ fontSize: '16px', marginBottom: '8px' }}>No messages yet</p>
+            <p style={{ fontSize: '14px', maxWidth: '300px' }}>
+              Start the conversation with {selectedFriend.username}. Your messages are end-to-end encrypted.
+            </p>
           </div>
         ) : (
-          messages.map(message => (
-            <div 
-              key={message.id} 
-              className={`max-w-[70%] mb-3 ${message.isMine ? 'ml-auto' : 'mr-auto'}`}
-            >
-              <div 
-                className={`relative p-3 rounded-2xl break-words ${
-                  message.isMine 
-                    ? 'bg-blue-500 text-white' 
-                    : 'bg-gray-200 text-gray-800'
-                }`}
-              >
-                <p className="m-0">{message.text}</p>
-                <span className={`block text-xs mt-1 ${message.isMine ? 'text-blue-100' : 'text-gray-500'}`}>
-                  {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                </span>
+          Object.entries(groupedMessages).map(([date, msgs]) => (
+            <div key={date}>
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                margin: '16px 0 8px 0'
+              }}>
+                <div style={{
+                  fontSize: '12px',
+                  color: '#6b7280',
+                  backgroundColor: 'rgba(229, 231, 235, 0.5)',
+                  padding: '4px 12px',
+                  borderRadius: '16px'
+                }}>
+                  {new Date(date).toLocaleDateString(undefined, { 
+                    weekday: 'long', 
+                    month: 'short', 
+                    day: 'numeric' 
+                  })}
+                </div>
               </div>
+              
+              {msgs.map(message => (
+                <div
+                  key={message.id}
+                  style={{
+                    display: 'flex',
+                    justifyContent: message.isMine ? 'flex-end' : 'flex-start',
+                    marginBottom: '8px'
+                  }}
+                >
+                  {!message.isMine && (
+                    <div style={{
+                      width: '32px',
+                      height: '32px',
+                      borderRadius: '50%',
+                      backgroundColor: '#e5e7eb',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      marginRight: '8px',
+                      fontSize: '14px',
+                      fontWeight: 'bold',
+                      color: '#4b5563',
+                      flexShrink: 0
+                    }}>
+                      {selectedFriend.username.charAt(0).toUpperCase()}
+                    </div>
+                  )}
+                  
+                  <div style={{
+                    maxWidth: '70%',
+                    padding: '12px 16px',
+                    borderRadius: message.isMine ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
+                    backgroundColor: message.isMine ? '#3b82f6' : 'white',
+                    color: message.isMine ? 'white' : '#374151',
+                    boxShadow: '0 1px 2px rgba(0, 0, 0, 0.05)',
+                    position: 'relative',
+                    wordBreak: 'break-word'
+                  }}>
+                    <div style={{ marginBottom: '4px' }}>
+                      {message.text}
+                    </div>
+                    <div style={{
+                      fontSize: '11px',
+                      color: message.isMine ? 'rgba(255, 255, 255, 0.7)' : '#9ca3af',
+                      textAlign: 'right',
+                      marginTop: '2px',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'flex-end',
+                      gap: '4px'
+                    }}>
+                      {encryptionReady && (
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <path d="M19 11H5V21H19V11Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                          <path d="M17 11V7C17 4.23858 14.7614 2 12 2C9.23858 2 7 4.23858 7 7V11" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                        </svg>
+                      )}
+                      {new Date(message.timestamp).toLocaleTimeString([], { 
+                        hour: '2-digit', 
+                        minute: '2-digit' 
+                      })}
+                    </div>
+                  </div>
+                  
+                  {message.isMine && (
+                    <div style={{
+                      width: '32px',
+                      height: '32px',
+                      display: 'flex',
+                      alignItems: 'flex-end',
+                      justifyContent: 'center',
+                      marginLeft: '8px'
+                    }}>
+                      {message.isMine && (
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <path d="M20 6L9 17L4 12" stroke="#3b82f6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                        </svg>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
           ))
         )}
         <div ref={messagesEndRef} />
       </div>
-      
-      <form className="flex p-4 bg-white border-t border-gray-200" onSubmit={sendMessage}>
-        <input
-          type="text"
-          ref={messageInputRef}
-          value={messageText}
-          onChange={(e) => setMessageText(e.target.value)}
-          placeholder={`Message ${selectedFriend?.username}...`}
-          className="flex-1 py-3 px-4 border border-gray-300 rounded-l-full text-base outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-        />
-        <button 
-          type="submit" 
-          disabled={!messageText.trim()} 
-          className="ml-2 py-3 px-6 bg-blue-500 text-white rounded-r-full font-medium cursor-pointer disabled:bg-gray-300 disabled:cursor-not-allowed hover:bg-blue-600 transition-colors"
+
+      {/* Enhanced Message Input */}
+      <form
+        onSubmit={sendMessage}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          padding: '16px',
+          backgroundColor: 'white',
+          borderTop: '1px solid #e5e7eb',
+          gap: '12px'
+        }}
+      >
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          flex: 1,
+          backgroundColor: '#f3f4f6',
+          borderRadius: '24px',
+          padding: '0 16px'
+        }}>
+          <button 
+            type="button"
+            style={{
+              background: 'none',
+              border: 'none',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#9ca3af',
+              padding: '8px'
+            }}
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M14.828 14.828a4 4 0 01-5.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </button>
+          
+          <input
+            type="text"
+            value={messageText}
+            onChange={e => setMessageText(e.target.value)}
+            placeholder={encryptionReady ? "Type a message..." : "Waiting for encryption..."}
+            disabled={!encryptionReady}
+            style={{
+              flex: 1,
+              border: 'none',
+              backgroundColor: 'transparent',
+              padding: '12px 8px',
+              fontSize: '15px',
+              outline: 'none',
+              color: '#374151'
+            }}
+          />
+          
+          <button 
+            type="button"
+            style={{
+              background: 'none',
+              border: 'none',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#9ca3af',
+              padding: '8px'
+            }}
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M21.44 11.05L12.25 20.24C11.12 21.37 9.61 22 8 22C6.39 22 4.88 21.37 3.75 20.24C2.62 19.11 2 17.6 2 16C2 14.4 2.63 12.89 3.76 11.76L12.33 3.19C12.85 2.67 13.54 2.38 14.25 2.38C14.96 2.38 15.65 2.67 16.17 3.19C16.69 3.71 16.99 4.4 16.99 5.11C16.99 5.82 16.69 6.51 16.17 7.03L7.59 15.61C7.33 15.87 6.98 16.01 6.62 16.01C6.26 16.01 5.91 15.87 5.65 15.61C5.39 15.35 5.25 15 5.25 14.64C5.25 14.28 5.39 13.93 5.65 13.67L14.06 5.26" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </button>
+        </div>
+        
+        <button
+          type="submit"
+          disabled={!messageText.trim() || !encryptionReady}
+          style={{
+            backgroundColor: messageText.trim() && encryptionReady ? '#3b82f6' : '#93c5fd',
+            color: 'white',
+            border: 'none',
+            borderRadius: '50%',
+            width: '48px',
+            height: '48px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            cursor: messageText.trim() && encryptionReady ? 'pointer' : 'not-allowed',
+            transition: 'background-color 0.2s',
+            flexShrink: 0
+          }}
         >
-          Send
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M22 2L11 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+            <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
         </button>
       </form>
     </div>
   );
-};
-
-export default ChatPage;
-
-
-// import React, { useEffect, useRef, useState } from "react";
-// import { useNavigate, useLocation } from "react-router";
-// import Gun from "gun";
-// import "gun/sea";
-// const SEA = Gun.SEA;
-
-// // Initialize Gun with the same peers
-// const gun = Gun({
-//   peers: ["http://localhost:4000/gun", "https://gun-manhattan.herokuapp.com/gun"],
-//   localStorage: false,
-// });
-
-// const ChatPage = () => {
-//   const navigate = useNavigate();
-//   const location = useLocation();
-//   const messageInputRef = useRef(null);
-//   const messagesEndRef = useRef(null);
-
-//   // User state
-//   const [currentUser, setCurrentUser] = useState(null);
-//   const [friends, setFriends] = useState([]);
-//   const [keyPair, setKeyPair] = useState(null);
-  
-//   // Chat state
-//   const [activeChat, setActiveChat] = useState(null);
-//   const [messages, setMessages] = useState([]);
-//   const [messageInput, setMessageInput] = useState("");
-//   const [loadingMessages, setLoadingMessages] = useState(false);
-//   const [friendKeyPairs, setFriendKeyPairs] = useState({});
-
-//   // Load user data on mount
-//   useEffect(() => {
-//     const loadUserData = async () => {
-//       if (location.state && location.state.currentUser) {
-//         setCurrentUser(location.state.currentUser);
-//         setFriends(Array.isArray(location.state.friends) ? location.state.friends : []);
-        
-//         // Check if a specific friend was selected from the Chat screen
-//         if (location.state.selectedFriend) {
-//           // Set it as the active chat after a short delay to ensure state is fully loaded
-//           setTimeout(() => {
-//             selectChat(location.state.selectedFriend);
-//           }, 100);
-//         }
-//       } else {
-//         // Try to load from localStorage
-//         const savedData = localStorage.getItem('userData');
-//         if (savedData) {
-//           try {
-//             const parsedData = JSON.parse(savedData);
-//             setCurrentUser({
-//               username: parsedData.username,
-//               account: parsedData.account,
-//               address: parsedData.account
-//             });
-//             setFriends(Array.isArray(parsedData.friends) ? parsedData.friends : []);
-//           } catch (e) {
-//             console.error("Error parsing saved user data:", e);
-//             navigate('/');
-//             return;
-//           }
-//         } else {
-//           navigate('/');
-//           return;
-//         }
-//       }
-//     };
-
-//     loadUserData();
-//   }, [location, navigate]);
-
-//   // Generate or load cryptographic key pair
-//   useEffect(() => {
-//     const generateOrLoadKeyPair = async () => {
-//       if (!currentUser?.account) return;
-      
-//       try {
-//         // Check if we have a stored key pair for this account
-//         const storedKeyPair = localStorage.getItem(`keyPair_${currentUser.account}`);
-//         if (storedKeyPair) {
-//           setKeyPair(JSON.parse(storedKeyPair));
-//         } else {
-//           // Generate a new key pair and store it
-//           const newKeyPair = await SEA.pair();
-//           setKeyPair(newKeyPair);
-//           localStorage.setItem(`keyPair_${currentUser.account}`, JSON.stringify(newKeyPair));
-          
-//           // Store public key in user's profile for others to encrypt messages to them
-//           gun.get('usersList').get(currentUser.account).get('publicKey').put(newKeyPair.pub);
-//         }
-//       } catch (error) {
-//         console.error("Error generating key pair:", error);
-//       }
-//     };
-
-//     generateOrLoadKeyPair();
-//   }, [currentUser]);
-
-//   // Load friend's public key
-//   const loadFriendPublicKey = async (friendId) => {
-//     return new Promise((resolve) => {
-//       gun.get('usersList').get(friendId).get('publicKey').once((publicKey) => {
-//         if (publicKey) {
-//           resolve(publicKey);
-//         } else {
-//           resolve(null);
-//         }
-//       });
-//     });
-//   };
-
-//   // Function to create shared secret between current user and friend
-//   const createSharedSecret = async (friendPublicKey) => {
-//     if (!keyPair || !friendPublicKey) return null;
-//     try {
-//       return await SEA.secret(friendPublicKey, keyPair);
-//     } catch (error) {
-//       console.error("Error creating shared secret:", error);
-//       return null;
-//     }
-//   };
-
-//   // Select chat
-//   const selectChat = async (friend) => {
-//     setActiveChat(friend);
-//     setMessages([]);
-//     setLoadingMessages(true);
-    
-//     // Load friend's public key if not already loaded
-//     if (!friendKeyPairs[friend.id]) {
-//       const publicKey = await loadFriendPublicKey(friend.id);
-//       if (publicKey) {
-//         const sharedSecret = await createSharedSecret(publicKey);
-//         setFriendKeyPairs(prev => ({
-//           ...prev,
-//           [friend.id]: { publicKey, sharedSecret }
-//         }));
-//       }
-//     }
-    
-//     // Create chat ID (sorted combination of user IDs to ensure same ID from both sides)
-//     const chatId = [currentUser.account, friend.id].sort().join('_');
-    
-//     // Subscribe to messages
-//     subscribeToMessages(chatId);
-//   };
-
-//   // Subscribe to messages for a chat
-//   const subscribeToMessages = (chatId) => {
-//     gun.get('chats').get(chatId).map().on(async (message, msgId) => {
-//       if (!message || !message.sender || !message.content) return;
-      
-//       try {
-//         // Check if the message is already in our state
-//         setMessages(prevMessages => {
-//           const isDuplicate = prevMessages.some(m => m.id === msgId);
-//           if (isDuplicate) return prevMessages;
-          
-//           // Add new message to state
-//           const newMessage = {
-//             id: msgId,
-//             sender: message.sender,
-//             timestamp: message.timestamp || Date.now(),
-//             content: message.content,
-//             decrypted: false // Will be decrypted in useEffect
-//           };
-          
-//           return [...prevMessages, newMessage].sort((a, b) => a.timestamp - b.timestamp);
-//         });
-//       } catch (error) {
-//         console.error("Error processing message:", error);
-//       }
-//     });
-    
-//     setLoadingMessages(false);
-//   };
-
-//   // Effect to decrypt messages when they come in or when sharedSecret changes
-//   useEffect(() => {
-//     const decryptMessages = async () => {
-//       if (!activeChat || !keyPair || !friendKeyPairs[activeChat.id]?.sharedSecret) return;
-      
-//       const sharedSecret = friendKeyPairs[activeChat.id].sharedSecret;
-      
-//       // Create a copy of messages and decrypt them
-//       const decryptedMessages = await Promise.all(
-//         messages.map(async (message) => {
-//           // Skip if already decrypted
-//           if (message.decrypted) return message;
-          
-//           try {
-//             // Try to decrypt the message
-//             const decryptedContent = await SEA.decrypt(message.content, sharedSecret);
-            
-//             return {
-//               ...message,
-//               decryptedContent: decryptedContent,
-//               decrypted: true
-//             };
-//           } catch (error) {
-//             console.error("Failed to decrypt message:", error);
-//             return {
-//               ...message,
-//               decryptedContent: "🔒 [Encrypted message]",
-//               decrypted: false
-//             };
-//           }
-//         })
-//       );
-      
-//       setMessages(decryptedMessages);
-//     };
-
-//     decryptMessages();
-//   }, [messages, activeChat, friendKeyPairs, keyPair]);
-
-//   // Scroll to bottom when messages change
-//   useEffect(() => {
-//     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-//   }, [messages]);
-
-//   // Send message
-//   const sendMessage = async (e) => {
-//     e.preventDefault();
-    
-//     if (!messageInput.trim() || !activeChat || !keyPair) return;
-    
-//     try {
-//       // Get friend's public key and shared secret
-//       const friendData = friendKeyPairs[activeChat.id];
-//       if (!friendData || !friendData.sharedSecret) {
-//         console.error("Cannot send message: No shared secret available");
-//         return;
-//       }
-      
-//       // Encrypt the message
-//       const encryptedContent = await SEA.encrypt(messageInput, friendData.sharedSecret);
-      
-//       // Chat ID (sorted to ensure same ID from both sides)
-//       const chatId = [currentUser.account, activeChat.id].sort().join('_');
-      
-//       // Add message to Gun
-//       const messageData = {
-//         sender: currentUser.account,
-//         receiver: activeChat.id,
-//         content: encryptedContent,
-//         timestamp: Date.now()
-//       };
-      
-//       gun.get('chats').get(chatId).set(messageData);
-      
-//       // Clear input
-//       setMessageInput("");
-//       messageInputRef.current?.focus();
-      
-//     } catch (error) {
-//       console.error("Error sending message:", error);
-//     }
-//   };
-
-//   // Navigate back to friend list
-//   const goToFriendList = () => {
-//     navigate("/chat", { 
-//       state: {
-//         currentUser: currentUser,
-//         friends: friends
-//       }
-//     });
-//   };
-
-//   // Format timestamp
-//   const formatTime = (timestamp) => {
-//     const date = new Date(timestamp);
-//     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-//   };
-
-//   return (
-//     <div className="flex flex-col h-screen bg-gray-900 text-white">
-//       {/* Header */}
-//       <div className="flex items-center justify-between p-4 bg-gray-800 border-b border-gray-700">
-//         <button 
-//           onClick={goToFriendList}
-//           className="py-2 px-4 bg-purple-600 text-white font-semibold rounded-lg hover:bg-purple-700 transition"
-//         >
-//           Back to Friends
-//         </button>
-        
-//         <div className="text-xl font-semibold">
-//           {activeChat ? `Chat with ${activeChat.username}` : 'Select a chat'}
-//         </div>
-        
-//         <div className="py-2 px-4 bg-gray-700 rounded-lg">
-//           {currentUser?.username}
-//         </div>
-//       </div>
-
-//       {/* Main area - Sidebar and Chat */}
-//       <div className="flex flex-1 overflow-hidden">
-//         {/* Friends sidebar */}
-//         <div className="w-64 bg-gray-800 border-r border-gray-700 overflow-y-auto">
-//           <div className="p-4 font-semibold text-gray-400">Your Friends</div>
-//           {friends.length > 0 ? (
-//             <ul>
-//               {friends.map((friend) => (
-//                 <li 
-//                   key={friend.id} 
-//                   onClick={() => selectChat(friend)}
-//                   className={`p-4 flex items-center cursor-pointer hover:bg-gray-700 transition ${
-//                     activeChat?.id === friend.id ? 'bg-gray-700' : ''
-//                   }`}
-//                 >
-//                   <div className="w-10 h-10 bg-purple-500 rounded-full flex items-center justify-center text-white font-bold">
-//                     {friend.username?.charAt(0).toUpperCase() || "?"}
-//                   </div>
-//                   <span className="ml-3">{friend.username}</span>
-//                 </li>
-//               ))}
-//             </ul>
-//           ) : (
-//             <div className="p-4 text-gray-500">No friends yet. Add some from the friends page.</div>
-//           )}
-//         </div>
-
-//         {/* Chat area */}
-//         <div className="flex-1 flex flex-col">
-//           {activeChat ? (
-//             <>
-//               {/* Messages area */}
-//               <div className="flex-1 p-4 overflow-y-auto bg-gray-900">
-//                 {loadingMessages ? (
-//                   <div className="flex items-center justify-center h-full">
-//                     <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-purple-500"></div>
-//                   </div>
-//                 ) : messages.length > 0 ? (
-//                   <div className="space-y-4">
-//                     {messages.map((message) => {
-//                       const isFromMe = message.sender === currentUser.account;
-//                       return (
-//                         <div 
-//                           key={message.id}
-//                           className={`flex ${isFromMe ? 'justify-end' : 'justify-start'}`}
-//                         >
-//                           <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
-//                             isFromMe 
-//                               ? 'bg-purple-600 text-white rounded-br-none' 
-//                               : 'bg-gray-700 rounded-bl-none'
-//                           }`}>
-//                             <div className="break-words">
-//                               {message.decryptedContent || "🔒 [Decrypting...]"}
-//                             </div>
-//                             <div className={`text-xs mt-1 ${isFromMe ? 'text-purple-200' : 'text-gray-400'}`}>
-//                               {formatTime(message.timestamp)}
-//                             </div>
-//                           </div>
-//                         </div>
-//                       );
-//                     })}
-//                     <div ref={messagesEndRef} />
-//                   </div>
-//                 ) : (
-//                   <div className="flex items-center justify-center h-full text-gray-500">
-//                     No messages yet. Start the conversation!
-//                   </div>
-//                 )}
-//               </div>
-
-//               {/* Message input */}
-//               <form onSubmit={sendMessage} className="p-4 bg-gray-800 border-t border-gray-700">
-//                 <div className="flex">
-//                   <input
-//                     ref={messageInputRef}
-//                     type="text"
-//                     value={messageInput}
-//                     onChange={(e) => setMessageInput(e.target.value)}
-//                     placeholder="Type a message..."
-//                     className="flex-1 py-2 px-4 bg-gray-700 text-white rounded-l-md focus:outline-none focus:ring-2 focus:ring-purple-500"
-//                   />
-//                   <button
-//                     type="submit"
-//                     disabled={!messageInput.trim()}
-//                     className="py-2 px-6 bg-purple-600 text-white rounded-r-md disabled:opacity-50 hover:bg-purple-700 transition"
-//                   >
-//                     Send
-//                   </button>
-//                 </div>
-//               </form>
-//             </>
-//           ) : (
-//             <div className="flex-1 flex items-center justify-center text-gray-500">
-//               Select a friend to start chatting
-//             </div>
-//           )}
-//         </div>
-//       </div>
-//     </div>
-//   );
-// };
-
-// export default ChatPage;
+}
