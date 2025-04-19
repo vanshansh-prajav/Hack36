@@ -3,6 +3,7 @@ import { useNavigate, useLocation } from 'react-router';
 import Gun from 'gun';
 import 'gun/sea';
 
+// Initialize Gun
 const gun = Gun({
   peers: [
     'http://localhost:4000/gun',
@@ -15,6 +16,8 @@ export default function ChatPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const didInit = useRef(false);
+  const fileInputRef = useRef(null);
+  const messagesEndRef = useRef(null);
 
   // Identity & Loading
   const [isLoading, setIsLoading] = useState(true);
@@ -24,10 +27,18 @@ export default function ChatPage() {
   // Messages & UI
   const [messages, setMessages] = useState([]);
   const [messageText, setMessageText] = useState('');
-  const messagesEndRef = useRef(null);
+
+  // Image Upload States
+  const [selectedImage, setSelectedImage] = useState(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [imagePreview, setImagePreview] = useState(null);
 
   // Encryption state
   const [encryptionReady, setEncryptionReady] = useState(false);
+
+  // Constants for image upload
+  const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB max image size
 
   // MetaMask helpers
   const getEncryptionPublicKey = useCallback(async (address) => {
@@ -56,6 +67,7 @@ export default function ChatPage() {
       try {
         const { username, account } = JSON.parse(saved);
         setCurrentUser({ username, address: account });
+        
         const friendStr = localStorage.getItem('selectedFriend');
         if (friendStr) {
           setSelectedFriend(JSON.parse(friendStr));
@@ -78,6 +90,7 @@ export default function ChatPage() {
   // 2. Publish public key
   useEffect(() => {
     if (!currentUser?.address) return;
+    
     (async () => {
       const key = await getEncryptionPublicKey(currentUser.address);
       if (key) {
@@ -90,15 +103,21 @@ export default function ChatPage() {
   // 3. Subscribe to messages
   useEffect(() => {
     if (!currentUser || !selectedFriend) return;
-
+    
     const chatId = [currentUser.address, selectedFriend.address].sort().join('_');
     const chatRef = gun.get('chats').get(chatId);
+    
     setMessages([]);
-
+    
     const processMessage = (data, id) => {
       if (!data?.text || !data.timestamp || !data.sender) return;
+      
+      // Handle image messages
+      const isImageMessage = data.isImage;
+      
       setMessages(prev => {
         if (prev.some(m => m.id === id)) return prev;
+        
         return [
           ...prev,
           {
@@ -107,16 +126,23 @@ export default function ChatPage() {
             sender: data.sender,
             timestamp: data.timestamp,
             isMine: data.sender === currentUser.address,
-            isEncrypted: !!data.isEncrypted
+            isEncrypted: !!data.isEncrypted,
+            isImage: !!isImageMessage,
+            imageName: data.imageName || null,
+            imageType: data.imageType || null,
+            imageSize: data.imageSize || null,
+            imageData: data.imageData || null
           }
         ].sort((a, b) => a.timestamp - b.timestamp);
       });
     };
-
+    
     chatRef.map().once(processMessage);
     chatRef.map().on(processMessage);
-
-    return () => { chatRef.map().off(); };
+    
+    return () => {
+      chatRef.map().off();
+    };
   }, [currentUser, selectedFriend]);
 
   // Auto-scroll
@@ -124,18 +150,107 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Send message
-  const sendMessage = useCallback(async (e) => {
-    e.preventDefault();
+  // Convert image to base64
+  const imageToBase64 = (file) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = (error) => reject(error);
+    });
+  };
+
+  // Handle image selection
+  const handleImageSelect = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    
+    // Check if file is an image
+    if (!file.type.startsWith('image/')) {
+      alert('Only image files are allowed (.jpg, .png, etc.)');
+      return;
+    }
+    
+    // Check file size
+    if (file.size > MAX_IMAGE_SIZE) {
+      alert(`Image size exceeds the maximum limit of ${MAX_IMAGE_SIZE / (1024 * 1024)}MB`);
+      return;
+    }
+    
+    setSelectedImage(file);
+    
+    // Create preview for images
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      setImagePreview(e.target.result);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Cancel image selection
+  const cancelImageSelection = () => {
+    setSelectedImage(null);
+    setImagePreview(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  // Send image message
+  const sendImageMessage = async () => {
+    if (!selectedImage || !encryptionReady) return;
+    
+    setIsUploading(true);
+    setUploadProgress(0);
+    
+    try {
+      // Convert image to base64
+      setUploadProgress(25);
+      const base64Image = await imageToBase64(selectedImage);
+      setUploadProgress(75);
+      
+      // Send message with image data
+      const chatId = [currentUser.address, selectedFriend.address].sort().join('_');
+      const chatRef = gun.get('chats').get(chatId);
+      
+      chatRef.set({
+        text: `Shared an image: ${selectedImage.name}`,
+        sender: currentUser.address,
+        timestamp: Date.now(),
+        isEncrypted: true,
+        isImage: true,
+        imageName: selectedImage.name,
+        imageType: selectedImage.type,
+        imageSize: selectedImage.size,
+        imageData: base64Image
+      });
+      
+      setUploadProgress(100);
+      setIsUploading(false);
+      
+      // Reset image selection
+      cancelImageSelection();
+    } catch (error) {
+      console.error('Error sending image:', error);
+      setIsUploading(false);
+      alert('Failed to send image. Please try again.');
+    }
+  };
+
+  // Send text message
+  const sendMessage = useCallback(async () => {
     if (!messageText.trim() || !encryptionReady) return;
+    
     const chatId = [currentUser.address, selectedFriend.address].sort().join('_');
     const chatRef = gun.get('chats').get(chatId);
+    
     chatRef.set({
       text: messageText,
       sender: currentUser.address,
       timestamp: Date.now(),
       isEncrypted: true
     });
+    
     setMessageText('');
   }, [messageText, encryptionReady, currentUser, selectedFriend]);
 
@@ -150,371 +265,201 @@ export default function ChatPage() {
     return groups;
   };
 
+  // Format file size
+  const formatFileSize = (bytes) => {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  };
+
+  // Format timestamp
+  const formatTime = (timestamp) => {
+    return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  };
+
   if (isLoading) {
     return (
-      <div style={{
-        display: 'flex',
-        justifyContent: 'center',
-        alignItems: 'center',
-        height: '100vh',
-        backgroundColor: '#f5f7fb',
-        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, sans-serif'
-      }}>
-        <div style={{
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          gap: '16px'
-        }}>
-          <div style={{
-            width: '40px',
-            height: '40px',
-            border: '3px solid #e0e0e0',
-            borderTopColor: '#3b82f6',
-            borderRadius: '50%',
-            animation: 'spin 1s linear infinite'
-          }}></div>
-          <p style={{ color: '#64748b', fontSize: '16px' }}>Loading chat...</p>
-        </div>
-        <style>{`
-          @keyframes spin {
-            to { transform: rotate(360deg); }
-          }
-        `}</style>
+      <div className="flex items-center justify-center h-screen bg-gray-100">
+        <div className="text-xl font-semibold text-gray-700">Loading chat...</div>
       </div>
     );
   }
 
+  const groupedMessages = groupMessagesByDate(messages);
+
   return (
-    <div style={{
-      display: 'flex',
-      flexDirection: 'column',
-      height: '100vh',
-      backgroundColor: '#f5f7fb',
-      fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, sans-serif'
-    }}>
-      {/* Enhanced Header */}
-      <div style={{
-        display: 'flex',
-        alignItems: 'center',
-        padding: '16px',
-        backgroundColor: 'white',
-        boxShadow: '0 1px 3px rgba(0, 0, 0, 0.1)',
-        position: 'relative',
-        zIndex: 10
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', width: '100%' }}>
-          <button
-            onClick={() => navigate('/home', { replace: true })}
-            style={{
-              background: 'none',
-              border: 'none',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: '40px',
-              height: '40px',
-              borderRadius: '50%',
-              transition: 'background-color 0.2s',
-              marginRight: '12px'
-            }}
-            onMouseOver={(e) => e.currentTarget.style.backgroundColor = '#f0f0f0'}
-            onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
-          >
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path d="M15 18L9 12L15 6" stroke="#374151" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-            </svg>
-          </button>
-          
-          <div style={{ display: 'flex', alignItems: 'center' }}>
-            <div style={{
-              width: '48px',
-              height: '48px',
-              borderRadius: '50%',
-              backgroundColor: '#e5e7eb',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              marginRight: '12px',
-              fontSize: '20px',
-              fontWeight: 'bold',
-              color: '#4b5563'
-            }}>
-              {selectedFriend.username.charAt(0).toUpperCase()}
-            </div>
-            
-            <div style={{ display: 'flex', flexDirection: 'column' }}>
-              <h2 style={{ margin: 0, fontSize: '18px', fontWeight: '600', color: '#111827' }}>
-                {selectedFriend.username}
-              </h2>
-              <div style={{
-                display: 'flex',
-                alignItems: 'center',
-                fontSize: '14px',
-                color: encryptionReady ? '#059669' : '#d97706',
-                marginTop: '4px'
-              }}>
-                {encryptionReady ? (
-                  <>
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ marginRight: '6px' }}>
-                      <path d="M19 11H5V21H19V11Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                      <path d="M17 11V7C17 4.23858 14.7614 2 12 2C9.23858 2 7 4.23858 7 7V11" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                    </svg>
-                    Encrypted
-                  </>
-                ) : (
-                  <>
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ marginRight: '6px' }}>
-                      <path d="M12 16V16.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                      <path d="M12 8V12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                      <path d="M12 21C16.9706 21 21 16.9706 21 12C21 7.02944 16.9706 3 12 3C7.02944 3 3 7.02944 3 12C3 16.9706 7.02944 21 12 21Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                    </svg>
-                    Setting up encryption...
-                  </>
-                )}
-              </div>
-            </div>
-          </div>
+    <div className="flex flex-col h-screen bg-gray-100">
+      {/* Header */}
+      <div className="bg-white shadow-sm p-4 flex items-center">
+        <div className="w-10 h-10 rounded-full bg-indigo-500 flex items-center justify-center text-white font-bold">
+          {selectedFriend.username.charAt(0).toUpperCase()}
+        </div>
+        <div className="ml-3">
+          <div className="font-semibold">{selectedFriend.username}</div>
+          <div className="text-xs text-gray-500">{selectedFriend.address.substring(0, 6)}...{selectedFriend.address.substring(selectedFriend.address.length - 4)}</div>
         </div>
       </div>
 
-      {/* Enhanced Messages Container */}
-      <div style={{
-        flex: 1,
-        overflowY: 'auto',
-        padding: '20px',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: '8px'
-      }}>
-        {messages.length === 0 ? (
-          <div style={{
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            justifyContent: 'center',
-            height: '100%',
-            color: '#6b7280',
-            textAlign: 'center',
-            padding: '0 20px'
-          }}>
-            <svg width="64" height="64" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ marginBottom: '16px', color: '#d1d5db' }}>
-              <path d="M21 15C21 15.5304 20.7893 16.0391 20.4142 16.4142C20.0391 16.7893 19.5304 17 19 17H7L3 21V5C3 4.46957 3.21071 3.96086 3.58579 3.58579C3.96086 3.21071 4.46957 3 5 3H19C19.5304 3 20.0391 3.21071 20.4142 3.58579C20.7893 3.96086 21 4.46957 21 5V15Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-            </svg>
-            <p style={{ fontSize: '16px', marginBottom: '8px' }}>No messages yet</p>
-            <p style={{ fontSize: '14px', maxWidth: '300px' }}>
-              Start the conversation with {selectedFriend.username}. Your messages are end-to-end encrypted.
-            </p>
-          </div>
-        ) : (
-          Object.entries(groupMessagesByDate(messages)).map(([date, msgs]) => (
-            <div key={date}>
-              <div style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                margin: '16px 0 8px 0'
-              }}>
-                <div style={{
-                  fontSize: '12px',
-                  color: '#6b7280',
-                  backgroundColor: 'rgba(229, 231, 235, 0.5)',
-                  padding: '4px 12px',
-                  borderRadius: '16px'
-                }}>
-                  {new Date(date).toLocaleDateString(undefined, { 
-                    weekday: 'long', 
-                    month: 'short', 
-                    day: 'numeric' 
-                  })}
-                </div>
+      {/* Chat Area */}
+      <div className="flex-1 overflow-y-auto p-4">
+        {Object.keys(groupedMessages).length > 0 ? (
+          Object.entries(groupedMessages).map(([date, dateMessages]) => (
+            <div key={date} className="mb-6">
+              <div className="text-center mb-4">
+                <span className="bg-gray-200 text-gray-600 text-xs px-2 py-1 rounded-full">
+                  {date}
+                </span>
               </div>
               
-              {msgs.map(message => (
-                <div
-                  key={message.id}
-                  style={{
-                    display: 'flex',
-                    justifyContent: message.isMine ? 'flex-end' : 'flex-start',
-                    marginBottom: '8px'
-                  }}
+              {dateMessages.map((message) => (
+                <div 
+                  key={message.id} 
+                  className={`flex mb-4 ${message.isMine ? 'justify-end' : 'justify-start'}`}
                 >
-                  {!message.isMine && (
-                    <div style={{
-                      width: '32px',
-                      height: '32px',
-                      borderRadius: '50%',
-                      backgroundColor: '#e5e7eb',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      marginRight: '8px',
-                      fontSize: '14px',
-                      fontWeight: 'bold',
-                      color: '#4b5563',
-                      flexShrink: 0
-                    }}>
-                      {selectedFriend.username.charAt(0).toUpperCase()}
-                    </div>
-                  )}
-                  
-                  <div style={{
-                    maxWidth: '70%',
-                    padding: '12px 16px',
-                    borderRadius: message.isMine ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
-                    backgroundColor: message.isMine ? '#3b82f6' : 'white',
-                    color: message.isMine ? 'white' : '#374151',
-                    boxShadow: '0 1px 2px rgba(0, 0, 0, 0.05)',
-                    position: 'relative',
-                    wordBreak: 'break-word'
-                  }}>
-                    <div style={{ marginBottom: '4px' }}>
-                      {message.text}
-                    </div>
-                    <div style={{
-                      fontSize: '11px',
-                      color: message.isMine ? 'rgba(255, 255, 255, 0.7)' : '#9ca3af',
-                      textAlign: 'right',
-                      marginTop: '2px',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'flex-end',
-                      gap: '4px'
-                    }}>
-                      {message.isEncrypted && (
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                          <path d="M19 11H5V21H19V11Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                          <path d="M17 11V7C17 4.23858 14.7614 2 12 2C9.23858 2 7 4.23858 7 7V11" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                        </svg>
-                      )}
-                      {new Date(message.timestamp).toLocaleTimeString([], { 
-                        hour: '2-digit', 
-                        minute: '2-digit' 
-                      })}
+                  <div 
+                    className={`max-w-xs lg:max-w-md rounded-lg p-4 ${
+                      message.isMine 
+                        ? 'bg-indigo-500 text-white rounded-br-none' 
+                        : 'bg-white text-gray-800 rounded-bl-none shadow'
+                    }`}
+                  >
+                    {message.isImage ? (
+                      <div className="image-message">
+                        <div className="mb-2 overflow-hidden rounded-lg">
+                          <img 
+                            src={message.imageData} 
+                            alt={message.imageName || "Shared image"} 
+                            className="w-full h-auto object-contain"
+                          />
+                        </div>
+                        <div className={`text-xs ${message.isMine ? 'text-indigo-100' : 'text-gray-500'} flex justify-between`}>
+                          <span>{message.imageName}</span>
+                          <span>{formatFileSize(message.imageSize)}</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div>{message.text}</div>
+                    )}
+                    <div className={`text-xs mt-1 text-right ${message.isMine ? 'text-indigo-100' : 'text-gray-500'}`}>
+                      {formatTime(message.timestamp)}
                     </div>
                   </div>
-                  
-                  {message.isMine && (
-                    <div style={{
-                      width: '32px',
-                      height: '32px',
-                      display: 'flex',
-                      alignItems: 'flex-end',
-                      justifyContent: 'center',
-                      marginLeft: '8px'
-                    }}>
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                        <path d="M20 6L9 17L4 12" stroke="#3b82f6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                      </svg>
-                    </div>
-                  )}
                 </div>
               ))}
             </div>
           ))
+        ) : (
+          <div className="flex flex-col items-center justify-center h-full text-gray-500">
+            <div className="text-center mb-4">
+              <svg className="w-16 h-16 mx-auto text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path>
+              </svg>
+            </div>
+            <p className="text-center">No messages yet</p>
+            <p className="text-center text-sm mt-2">Start the conversation with {selectedFriend.username}. Your messages are end-to-end encrypted.</p>
+          </div>
         )}
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Enhanced Message Input */}
-      <form
-        onSubmit={sendMessage}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          padding: '16px',
-          backgroundColor: 'white',
-          borderTop: '1px solid #e5e7eb',
-          gap: '12px'
-        }}
-      >
-        <div style={{
-          display: 'flex',
-          alignItems: 'center',
-          flex: 1,
-          backgroundColor: '#f3f4f6',
-          borderRadius: '24px',
-          padding: '0 16px'
-        }}>
-          <button 
-            type="button"
-            style={{
-              background: 'none',
-              border: 'none',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              color: '#9ca3af',
-              padding: '8px'
-            }}
+      {/* Image Preview */}
+      {imagePreview && (
+        <div className="bg-gray-100 p-3 border-t border-gray-200">
+          <div className="relative inline-block">
+            <img 
+              src={imagePreview} 
+              alt="Preview" 
+              className="h-32 w-auto rounded-lg border border-gray-300"
+            />
+            <button 
+              onClick={cancelImageSelection}
+              className="absolute -top-2 -right-2 bg-red-500 text-white rounded-full p-1"
+            >
+              🔧
+            </button>
+          </div>
+          <div className="mt-2 text-sm text-gray-600">
+            <div>{selectedImage.name}</div>
+            <div>{formatFileSize(selectedImage.size)}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Input Area */}
+      <div className="bg-white border-t border-gray-200 p-4">
+        {isUploading ? (
+          <div className="bg-gray-100 rounded-lg p-4 mb-4">
+            <div className="text-sm font-medium text-gray-700 mb-2">Uploading image...</div>
+            <div className="w-full bg-gray-200 rounded-full h-2.5">
+              <div 
+                className="bg-indigo-600 h-2.5 rounded-full transition-all duration-300" 
+                style={{ width: `${uploadProgress}%` }}
+              ></div>
+            </div>
+            <div className="text-xs text-gray-500 mt-1 text-right">{uploadProgress}%</div>
+          </div>
+        ) : null}
+        
+        <div className="flex items-center">
+          <input
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={handleImageSelect}
+            ref={fileInputRef}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            className="p-2 rounded-full text-gray-500 hover:text-indigo-500 hover:bg-gray-100 focus:outline-none"
           >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path d="M14.828 14.828a4 4 0 01-5.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-            </svg>
+            📎
           </button>
           
           <input
             type="text"
             value={messageText}
-            onChange={e => setMessageText(e.target.value)}
-            placeholder={encryptionReady ? "Type a secure message..." : "Waiting for encryption..."}
-            disabled={!encryptionReady}
-            style={{
-              flex: 1,
-              border: 'none',
-              backgroundColor: 'transparent',
-              padding: '12px 8px',
-              fontSize: '15px',
-              outline: 'none',
-              color: '#374151'
+            onChange={(e) => setMessageText(e.target.value)}
+            placeholder="Type a message..."
+            className="flex-1 border border-gray-300 rounded-full px-4 py-2 mx-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            onKeyPress={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                if (imagePreview) {
+                  sendImageMessage();
+                } else {
+                  sendMessage();
+                }
+              }
             }}
           />
           
-          <button 
-            type="button"
-            style={{
-              background: 'none',
-              border: 'none',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              color: '#9ca3af',
-              padding: '8px'
-            }}
-          >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path d="M21.44 11.05L12.25 20.24C11.12 21.37 9.61 22 8 22C6.39 22 4.88 21.37 3.75 20.24C2.62 19.11 2 17.6 2 16C2 14.4 2.63 12.89 3.76 11.76L12.33 3.19C12.85 2.67 13.54 2.38 14.25 2.38C14.96 2.38 15.65 2.67 16.17 3.19C16.69 3.71 16.99 4.4 16.99 5.11C16.99 5.82 16.69 6.51 16.17 7.03L7.59 15.61C7.33 15.87 6.98 16.01 6.62 16.01C6.26 16.01 5.91 15.87 5.65 15.61C5.39 15.35 5.25 15 5.25 14.64C5.25 14.28 5.39 13.93 5.65 13.67L14.06 5.26" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-            </svg>
-          </button>
+          {imagePreview ? (
+            <button
+              onClick={sendImageMessage}
+              disabled={isUploading || !encryptionReady}
+              className={`p-2 rounded-full ${
+                isUploading || !encryptionReady
+                  ? 'bg-gray-300 text-gray-500'
+                  : 'bg-indigo-500 text-white hover:bg-indigo-600'
+              } focus:outline-none`}
+            >
+              📩
+            </button>
+          ) : (
+            <button
+              onClick={sendMessage}
+              disabled={!messageText.trim() || !encryptionReady}
+              className={`p-2 rounded-full ${
+                !messageText.trim() || !encryptionReady
+                  ? 'bg-gray-300 text-gray-500'
+                  : 'bg-indigo-500 text-white hover:bg-indigo-600'
+              } focus:outline-none`}
+            >
+              📩
+            </button>
+          )}
         </div>
-        
-        <button
-          type="submit"
-          disabled={!messageText.trim() || !encryptionReady}
-          style={{
-            backgroundColor: messageText.trim() && encryptionReady ? '#3b82f6' : '#93c5fd',
-            color: 'white',
-            border: 'none',
-            borderRadius: '50%',
-            width: '48px',
-            height: '48px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            cursor: messageText.trim() && encryptionReady ? 'pointer' : 'not-allowed',
-            transition: 'background-color 0.2s',
-            flexShrink: 0
-          }}
-        >
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M22 2L11 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-            <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-          </svg>
-        </button>
-      </form>
+      </div>
     </div>
   );
 }
