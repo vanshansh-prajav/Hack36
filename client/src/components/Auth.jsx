@@ -91,35 +91,36 @@ function Auth() {
         return;
       }
       
-      await connectWallet();
+      // Get the direct result from connectWallet
+      const walletResult = await connectWallet();
       
-      if (error) {
-        setAuthError(error);
-        return;
-      }
+      // Use the returned account value or fall back to the state value
+      const walletAccount = walletResult?.account || account;
+      const walletSignature = walletResult?.signature || signature;
       
-      if (!account) {
+      if (!walletAccount) {
         console.warn("No account after connectWallet");
         setAuthError("Failed to connect wallet");
         return;
       }
       
-      
+      // Store session data using the directly returned account
       localStorage.setItem('userData', JSON.stringify({
-        account,
+        account: walletAccount,
         username,
+        signature: walletSignature,
         lastLogin: new Date().toISOString(),
         friends: []
       }));
-
-      await authenticateUser({ account, username });
-      const userData = await getUserProfile(account);
+  
+      await authenticateUser({ account: walletAccount, username });
+      const userData = await getUserProfile(walletAccount);
       
       navigate("/home", { 
         state: {
           ...userData,
-          account,
-          signature,
+          account: walletAccount,
+          signature: walletSignature,
           username
         }
       });
@@ -128,6 +129,7 @@ function Auth() {
       setAuthError(err.message || "Authentication failed");
     }
   };
+  
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-900">
