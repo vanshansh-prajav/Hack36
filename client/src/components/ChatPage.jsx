@@ -60,7 +60,7 @@ export default function ChatPage() {
         if (friendStr) {
           setSelectedFriend(JSON.parse(friendStr));
         } else {
-          navigate('/friends', { replace: true });
+          navigate('/home', { replace: true });
           return;
         }
       } catch {
@@ -107,6 +107,7 @@ export default function ChatPage() {
             sender: data.sender,
             timestamp: data.timestamp,
             isMine: data.sender === currentUser.address,
+            isEncrypted: !!data.isEncrypted
           }
         ].sort((a, b) => a.timestamp - b.timestamp);
       });
@@ -133,11 +134,12 @@ export default function ChatPage() {
       text: messageText,
       sender: currentUser.address,
       timestamp: Date.now(),
+      isEncrypted: true
     });
     setMessageText('');
   }, [messageText, encryptionReady, currentUser, selectedFriend]);
 
-  // Group messages by date for better organization
+  // Helper function to group messages by date
   const groupMessagesByDate = (msgs) => {
     const groups = {};
     msgs.forEach(msg => {
@@ -147,8 +149,6 @@ export default function ChatPage() {
     });
     return groups;
   };
-
-  const groupedMessages = groupMessagesByDate(messages);
 
   if (isLoading) {
     return (
@@ -308,7 +308,7 @@ export default function ChatPage() {
             </p>
           </div>
         ) : (
-          Object.entries(groupedMessages).map(([date, msgs]) => (
+          Object.entries(groupMessagesByDate(messages)).map(([date, msgs]) => (
             <div key={date}>
               <div style={{
                 display: 'flex',
@@ -382,7 +382,7 @@ export default function ChatPage() {
                       justifyContent: 'flex-end',
                       gap: '4px'
                     }}>
-                      {encryptionReady && (
+                      {message.isEncrypted && (
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                           <path d="M19 11H5V21H19V11Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
                           <path d="M17 11V7C17 4.23858 14.7614 2 12 2C9.23858 2 7 4.23858 7 7V11" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
@@ -404,11 +404,9 @@ export default function ChatPage() {
                       justifyContent: 'center',
                       marginLeft: '8px'
                     }}>
-                      {message.isMine && (
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                          <path d="M20 6L9 17L4 12" stroke="#3b82f6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                        </svg>
-                      )}
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M20 6L9 17L4 12" stroke="#3b82f6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                      </svg>
                     </div>
                   )}
                 </div>
@@ -461,7 +459,7 @@ export default function ChatPage() {
             type="text"
             value={messageText}
             onChange={e => setMessageText(e.target.value)}
-            placeholder={encryptionReady ? "Type a message..." : "Waiting for encryption..."}
+            placeholder={encryptionReady ? "Type a secure message..." : "Waiting for encryption..."}
             disabled={!encryptionReady}
             style={{
               flex: 1,
